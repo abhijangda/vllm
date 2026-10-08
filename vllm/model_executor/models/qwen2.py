@@ -33,6 +33,7 @@ import torch
 from torch import nn
 from transformers import Qwen2Config
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -95,6 +96,22 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
+        use_strassen = (
+            envs.VLLM_STRASSEN_LIBRARY_PATH
+            and hidden_size == 8192
+            and intermediate_size == 29568
+        )
+        if use_strassen:
+            if quant_config is not None or get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("BF16 Strassen Qwen MLP requires unquantized TP=1")
+            if envs.VLLM_BATCH_INVARIANT:
+                raise ValueError("Strassen does not support batch-invariant execution")
+            from vllm.model_executor.layers.strassen import (
+                StrassenDownLinearMethod,
+                StrassenLinearMethod,
+            )
+
+            self.gate_up_proj.quant_method = StrassenLinearMethod()
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -102,6 +119,8 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
+        if use_strassen:
+            self.down_proj.quant_method = StrassenDownLinearMethod()
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
