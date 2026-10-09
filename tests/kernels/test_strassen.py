@@ -10,13 +10,18 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.model_executor.layers.strassen import (
+    ATTENTION_KERNELS,
     CLUSTER_PARITY_TOKEN_SIZES,
     MLP2_KERNELS,
     PREFILL_TOKEN_SIZES,
+    StrassenAttentionLinearMethod,
+    StrassenDownLinearMethod,
     StrassenLinearMethod,
+    _attention_workspace,
     _library,
     _mlp2_workspace,
     _workspace,
+    load_attention_configs,
     load_mlp2_configs,
     load_strassen_configs,
     pad_mlp_token_rows,
@@ -45,6 +50,240 @@ def down_projection(projection):
     weight = pad_mlp_weight(weight, gate_up=False)
     packed, presums = prepare_strassen_weight(weight)
     return weight, packed, presums, _mlp2_workspace(weight.device)
+
+
+@pytest.fixture(scope="module", params=["attention_qkv", "attention_o_proj"])
+def attention_projection(projection, request):
+    name = request.param
+    n = 10240 if name == "attention_qkv" else 8192
+    weight = torch.randn(n, 8192, device="cuda", dtype=torch.bfloat16) * 0.01
+    bias = (
+        torch.randn(n, device="cuda", dtype=torch.bfloat16) * 0.01
+        if name == "attention_qkv"
+        else None
+    )
+    packed, presums = prepare_strassen_weight(weight)
+    return name, weight, bias, packed, presums, _attention_workspace(weight.device)
+
+
+@pytest.mark.parametrize("kernel_id", range(len(ATTENTION_KERNELS)))
+@pytest.mark.parametrize("tokens", PREFILL_TOKEN_SIZES)
+def test_attention_variants_preserve_channels_and_bias(
+    attention_projection, kernel_id, tokens
+):
+    name, weight, bias, packed, presums, workspace = attention_projection
+    x = torch.randn(tokens, 8192, device="cuda", dtype=torch.bfloat16) * 0.1
+    expected = F.linear(x, weight, bias)
+    workspace.fill_(255)
+    with patch(
+        "vllm.model_executor.layers.strassen.F.linear",
+        side_effect=AssertionError("Supported attention sizes must use Strassen"),
+    ):
+        actual = torch.ops.vllm.strassen_bf16_attention(
+            x, weight, bias, packed, presums, workspace, name, kernel_id, 1, 0
+        )
+    assert actual.shape == expected.shape and actual.is_contiguous()
+    sizes = [8192, 1024, 1024] if name == "attention_qkv" else [8192]
+    for a, e in zip(actual.split(sizes, -1), expected.split(sizes, -1)):
+        assert_projection_close(a, e)
+
+
+@pytest.mark.parametrize("kernel_id", range(len(ATTENTION_KERNELS)))
+@pytest.mark.parametrize("tokens", [1024, 16384])
+@pytest.mark.parametrize("unsafe", [False, True])
+@pytest.mark.parametrize("skip_bias", [False, True])
+def test_attention_graph_replay_recomputes_projection(
+    attention_projection, kernel_id, tokens, unsafe, skip_bias, monkeypatch
+):
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_UNSAFE_SKIP_ACTIVATION_PACKING", unsafe)
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_UNSAFE_SKIP_QKV_BIAS", skip_bias)
+    name, weight, bias, packed, presums, workspace = attention_projection
+    x = torch.randn(tokens, 8192, device="cuda", dtype=torch.bfloat16) * 0.1
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            torch.ops.vllm.strassen_bf16_attention(
+                x, weight, bias, packed, presums, workspace, name, kernel_id, 2, 1
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = torch.ops.vllm.strassen_bf16_attention(
+            x, weight, bias, packed, presums, workspace, name, kernel_id, 2, 1
+        )
+    for scale in (-0.5, 2.0):
+        x.mul_(scale)
+        workspace.fill_(255)
+        graph.replay()
+        reference_x = (
+            x.reshape(2, 2, tokens // 2, 4096).permute(0, 2, 1, 3).reshape_as(x)
+            if unsafe
+            else x
+        )
+        reference_bias = None if skip_bias and name == "attention_qkv" else bias
+        assert_projection_close(actual, F.linear(reference_x, weight, reference_bias))
+
+
+@pytest.mark.parametrize("tokens", [16, 1024])
+@pytest.mark.parametrize("skip_bias", [False, True])
+def test_qkv_bias_is_preserved_unless_explicitly_bypassed(
+    attention_projection, tokens, skip_bias, monkeypatch
+):
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_UNSAFE_SKIP_QKV_BIAS", skip_bias)
+    name, weight, bias, packed, presums, workspace = attention_projection
+    x = torch.zeros(tokens, 8192, device="cuda", dtype=torch.bfloat16)
+    output = torch.ops.vllm.strassen_bf16_attention(
+        x, weight, bias, packed, presums, workspace, name, 0, 1, 0
+    )
+    expected = torch.zeros_like(output)
+    if name == "attention_qkv" and not skip_bias:
+        expected += bias
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [1, 512])
+def test_attention_unsupported_rows_keep_dense_fallback(attention_projection, tokens):
+    name, weight, bias, packed, presums, workspace = attention_projection
+    x = torch.randn(tokens, 8192, device="cuda", dtype=torch.bfloat16)
+    actual = torch.ops.vllm.strassen_bf16_attention(
+        x, weight, bias, packed, presums, workspace, name, 0, 1, 0
+    )
+    torch.testing.assert_close(actual, F.linear(x, weight, bias), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("drop_dense", [False, True])
+def test_attention_prepares_once_and_preserves_projection_without_dense_weights(
+    attention_projection, tmp_path, monkeypatch, drop_dense
+):
+    name, weight, bias, _, _, _ = attention_projection
+    path = tmp_path / "attention.json"
+    path.write_text(
+        json.dumps(
+            {
+                str(m): {"kernel": ATTENTION_KERNELS[0], "raster": "N", "swizzle": 2}
+                for m in PREFILL_TOKEN_SIZES
+            }
+        )
+    )
+    variable = (
+        "VLLM_STRASSEN_QKV_CONFIG_PATH"
+        if name == "attention_qkv"
+        else "VLLM_STRASSEN_ATTN_OUT_CONFIG_PATH"
+    )
+    monkeypatch.setattr(envs, variable, str(path))
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_DROP_DENSE_WEIGHTS", drop_dense)
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_PAD_TOKEN_ROWS", True)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.prefix = f"test.{name}"
+    method = StrassenAttentionLinearMethod(name)
+    method.process_weights_after_loading(layer)
+    assert (layer.weight is None) == drop_dense
+    operation = torch.compile(method.apply, backend="eager", fullgraph=True)
+    x = torch.randn(31, 8192, device="cuda", dtype=torch.bfloat16) * 0.1
+    with patch(
+        "vllm.model_executor.layers.strassen.prepare_strassen_weight",
+        side_effect=AssertionError("Weight pre-sums must not be recomputed"),
+    ):
+        for scale in (1.0, -0.5):
+            x.mul_(scale)
+            assert_projection_close(
+                operation(layer, x, bias), F.linear(x, weight, bias)
+            )
+
+
+def test_attention_without_dense_weight_rejects_unsupported_rows(attention_projection):
+    name, _, bias, packed, presums, workspace = attention_projection
+    x = torch.empty(16385, 8192, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="dense weights were released"):
+        torch.ops.vllm.strassen_bf16_attention(
+            x, None, bias, packed, presums, workspace, name, 0, 1, 0
+        )
+
+
+def test_attention_configuration_rejects_invalid_entries(tmp_path):
+    path = tmp_path / "attention.json"
+    data = {
+        str(m): {"kernel": ATTENTION_KERNELS[0], "raster": "N", "swizzle": 2}
+        for m in PREFILL_TOKEN_SIZES
+    }
+    data["1024"]["swizzle"] = 4
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Unsupported attention swizzle"):
+        load_attention_configs(str(path))
+    data["1024"]["kernel"] = "unknown"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="Invalid attention"):
+        load_attention_configs(str(path))
+    del data["1024"]
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="must cover"):
+        load_attention_configs(str(path))
+
+
+@pytest.mark.parametrize("kernel_id", [-1, len(ATTENTION_KERNELS)])
+def test_attention_native_rejects_unknown_kernel(projection, kernel_id):
+    assert (
+        _library().vllm_strassen_attention_run_v1(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            1024,
+            10240,
+            8192,
+            0,
+            132,
+            1,
+            0,
+            0,
+            kernel_id,
+            None,
+        )
+        != 0
+    )
+
+
+@pytest.mark.parametrize("drop_dense", [False, True])
+def test_mlp2_weight_release_retains_padded_projection(
+    down_projection, tmp_path, monkeypatch, drop_dense
+):
+    weight, _, _, _ = down_projection
+    path = tmp_path / "mlp2.json"
+    path.write_text(
+        json.dumps(
+            {
+                str(m): {"kernel": MLP2_KERNELS[0], "raster": "N", "swizzle": 2}
+                for m in PREFILL_TOKEN_SIZES
+            }
+        )
+    )
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_MLP2_CONFIG_PATH", str(path))
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_DROP_DENSE_WEIGHTS", drop_dense)
+    monkeypatch.setattr(envs, "VLLM_STRASSEN_PAD_TOKEN_ROWS", True)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    layer.prefix = "test.down_proj"
+    method = StrassenDownLinearMethod()
+    method.process_weights_after_loading(layer)
+    assert (layer.weight is None) == drop_dense
+    operation = torch.compile(method.apply, backend="eager", fullgraph=True)
+    x = torch.randn(31, 29696, device="cuda", dtype=torch.bfloat16) * 0.1
+    with patch(
+        "vllm.model_executor.layers.strassen.prepare_strassen_weight",
+        side_effect=AssertionError("Weight pre-sums must not be recomputed"),
+    ):
+        assert_projection_close(operation(layer, x), F.linear(x, weight))
+
+
+def test_mlp2_without_dense_weight_rejects_unsupported_rows(down_projection):
+    _, packed, presums, workspace = down_projection
+    x = torch.empty(1, 29696, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="dense weights were released"):
+        torch.ops.vllm.strassen_bf16_mlp2(x, None, packed, presums, workspace, 0, 1, 0)
 
 
 @pytest.mark.parametrize("kernel_id", range(len(MLP2_KERNELS)))

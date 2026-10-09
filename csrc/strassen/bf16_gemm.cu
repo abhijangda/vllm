@@ -35,7 +35,10 @@ int status_code(cutlass::Status status) {
   return status == cutlass::Status::kSuccess ? 0 : 1000 + int(status);
 }
 
-template <typename Cluster, bool Pingpong = false, int PresumRows = 2>
+template <typename Cluster, bool Pingpong = false, int PresumRows = 2,
+          bool Mixed = false, bool Reduce = true,
+          typename PresumOptions = cutlass::gemm::device::PresumOpt<>,
+          bool Ordered = (PresumRows == 4)>
 struct StrassenKernel {
   using Tile = std::conditional_t<Pingpong, Shape<_128, _128, _64>,
                                   Shape<_128, _256, _64>>;
@@ -49,14 +52,34 @@ struct StrassenKernel {
                          cutlass::epilogue::TmaWarpSpecializedCooperative>;
   using PresumTile = std::conditional_t<Pingpong, Shape<Int<PresumRows>, _128>,
                                         Shape<Int<PresumRows>, _256>>;
-  using Writes236 = RWCTypes<CUW<1, LayoutFinal, LayoutNone, Expr<Plus<2>>,
-                                 Expr<Plus<1, MemGlobal, LayoutInterim>>>,
-                             CUW<3, LayoutFinal, LayoutNone, Expr<Plus<3>>>,
-                             CUW<2, LayoutFinal, LayoutNone, Expr<Neg<6>>>>;
-  using Writes45 = RWCTypes<CUW<3, LayoutFinal, LayoutNone, Expr<Plus<4>>,
-                                Expr<Plus<3, MemGlobal, LayoutFinal>>>,
-                            CUW<1, LayoutFinal, LayoutNone, Expr<Plus<5>>,
-                                Expr<Plus<1, MemGlobal, LayoutFinal>>>>;
+  using RestTile = std::conditional_t<Mixed, Shape<_128, _128, _64>, Tile>;
+  static constexpr int RestStages = Mixed ? 6 : Stages;
+  using RestSchedule =
+      std::conditional_t<Mixed, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+                         Schedule>;
+  using RestEpilogue =
+      std::conditional_t<Mixed, cutlass::epilogue::TmaWarpSpecialized,
+                         Epilogue>;
+  using Writes236 = std::conditional_t<
+      Reduce,
+      RWCTypes<CUW<1, LayoutFinal, LayoutNone, Expr<Plus<2>>,
+                   Expr<Plus<1, MemGlobal, LayoutInterim>>>,
+               CUW<3, LayoutFinal, LayoutNone, Expr<Plus<3>>>,
+               CUW<2, LayoutFinal, LayoutNone, Expr<Neg<6>>>>,
+      RWCTypes<CUW<1, LayoutInterim, LayoutNone, Expr<Plus<2>>,
+                   Expr<Plus<1, MemGlobal, LayoutInterim>>>,
+               CUW<2, LayoutInterim, LayoutNone, Expr<Plus<3>>>,
+               CUW<2, LayoutFinal, LayoutNone, Expr<Neg<6>>>>>;
+  using Writes45 = std::conditional_t<
+      Reduce,
+      RWCTypes<CUW<3, LayoutFinal, LayoutNone, Expr<Plus<4>>,
+                   Expr<Plus<3, MemGlobal, LayoutFinal>>>,
+               CUW<1, LayoutFinal, LayoutNone, Expr<Plus<5>>,
+                   Expr<Plus<1, MemGlobal, LayoutFinal>>>>,
+      RWCTypes<CUW<3, LayoutFinal, LayoutNone, Expr<Plus<4>>,
+                   Expr<Plus<2, MemGlobal, LayoutInterim>>>,
+               CUW<1, LayoutFinal, LayoutNone, Expr<Plus<5>>,
+                   Expr<Plus<1, MemGlobal, LayoutInterim>>>>>;
   using Groups = StrassenLevel1Groups<
       StrassenPresum<1, 0, Tile, Presums0>,
       StrassenLevel1MiGroup<
@@ -69,43 +92,45 @@ struct StrassenKernel {
           RWCTypes<CUW<0, LayoutFinal, LayoutNone, Expr<Plus<1>>,
                        Expr<Plus<1, MemGlobal, LayoutInterim1D>>>>,
           Presums0>,
-      StrassenLevel1MiGroup<1, 0, Tile, Cluster, Stages, RWMTypes<>, Writes236,
-                            PresumsRest, 0, 2, 3, 6>,
+      StrassenLevel1MiGroup<1, 0, RestTile, Cluster, RestStages, RWMTypes<>,
+                            Writes236, PresumsRest, 0, 2, 3, 6>,
       StrassenLevel1M3Group<
-          1, 0, Tile, Cluster, Stages, RWMTypes<>,
+          1, 0, RestTile, Cluster, RestStages, RWMTypes<>,
           RWCTypes<CUW<2, LayoutNone, LayoutInterim1D, Expr<Plus<3>>,
                        Expr<Plus<1, MemGlobal, LayoutInterim1D>>>>,
           PresumsRest>,
-      StrassenLevel1MiGroup<1, 0, Tile, Cluster, Stages, RWMTypes<>, Writes45,
-                            PresumsRest, 0, 4, 5>,
+      StrassenLevel1MiGroup<1, 0, RestTile, Cluster, RestStages, RWMTypes<>,
+                            Writes45, PresumsRest, 0, 4, 5>,
       StrassenLevel1M5Group<
-          1, 0, Tile, Cluster, Stages, RWMTypes<>,
+          1, 0, RestTile, Cluster, RestStages, RWMTypes<>,
           RWCTypes<CUW<1, LayoutFinal, LayoutNone, Expr<Plus<5>>,
                        Expr<Plus<1, MemGlobal, LayoutInterim1D>,
                             Plus<0, MemGlobal, LayoutInterim1D>>>>,
           PresumsRest>,
       StrassenLevel1M6Group<
-          1, 0, Tile, Cluster, Stages, RWMTypes<>,
+          1, 0, RestTile, Cluster, RestStages, RWMTypes<>,
           RWCTypes<CUW<2, LayoutFinal, LayoutNone, Expr<Neg<6>>,
                        Expr<Plus<2, MemGlobal, LayoutInterim1D>>>>,
           PresumsRest>>;
   using Schedules = std::conditional_t<
-      PresumRows == 4,
+      Ordered,
       ScheduleStrassenGroups<
           ParallelMiGroups<Schedule, Epilogue, false, FusedMiGroup<7, 0>>,
-          ParallelMiGroups<Schedule, Epilogue, false, FusedMiGroup<7, 2>>,
-          ParallelMiGroups<Schedule, Epilogue, false, FusedMiGroup<7, 4>>>,
+          ParallelMiGroups<RestSchedule, RestEpilogue, false,
+                           FusedMiGroup<7, 2>>,
+          ParallelMiGroups<RestSchedule, RestEpilogue, false,
+                           FusedMiGroup<7, 4>>>,
       ScheduleStrassenGroups<
           ParallelMiGroups<Schedule, Epilogue, false, FusedMiGroup<7, 0>>,
-          ParallelMiGroups<Schedule, Epilogue, false, FusedMiGroup<7, 2>,
-                           FusedMiGroup<7, 4>>>>;
+          ParallelMiGroups<RestSchedule, RestEpilogue, false,
+                           FusedMiGroup<7, 2>, FusedMiGroup<7, 4>>>>;
   using Kernels = cutlass::gemm::device::StrassenGemmKernels<
       Groups, Schedules, Shape<int, int, int>, cutlass::arch::Sm90,
       cutlass::arch::OpClassTensorOp, Element, cutlass::layout::RowMajor,
       cutlass::layout::StrassenLayout, Element, cutlass::layout::RowMajor,
       cutlass::layout::StrassenLayout, void, cutlass::layout::RowMajor,
       cutlass::layout::OriginalLayout, float, Cluster, Int<Stages>, PresumTile,
-      PresumTile, cutlass::gemm::device::PresumOpt<>, 8, 8, 8, Element>;
+      PresumTile, PresumOptions, 8, 8, 8, Element>;
   using Gemm = cutlass::gemm::device::StrassenGemmUniversalAdapter<Kernels>;
   using K0 = typename Gemm::GemmKernelM0;
   using K1 = typename Gemm::GemmKernelM1;
@@ -206,7 +231,7 @@ struct StrassenKernel {
         Gemm::template run_parallel<P1>(p0, p1, p2, p3, p4, p5, p6, stream);
     if (status != cutlass::Status::kSuccess) return status_code(status);
     if constexpr (P2::HasAKernel()) {
-      // M4/M5 reduce into outputs initialized by M2/M3 on the same stream.
+      // M4/M5 consume outputs initialized by M2/M3 on the same stream.
       status =
           Gemm::template run_parallel<P2>(p0, p1, p2, p3, p4, p5, p6, stream);
       if (status != cutlass::Status::kSuccess) return status_code(status);
@@ -237,6 +262,27 @@ constexpr KernelFunctions Mlp2Kernels[] = {
     kernel_functions<Mlp2Cooperative2x1>(),
     kernel_functions<Mlp2Cooperative1x2>()};
 constexpr int Mlp2KernelCount = sizeof(Mlp2Kernels) / sizeof(Mlp2Kernels[0]);
+
+using FixedPresums = cutlass::gemm::device::PresumOpt<0, 0, 0, 0>;
+template <typename Cluster, bool Mixed = false, bool Reduce = true,
+          typename PresumOptions = FixedPresums>
+using AttentionKernel =
+    StrassenKernel<Cluster, !Mixed, 2, Mixed, Reduce, PresumOptions, true>;
+constexpr KernelFunctions AttentionKernels[] = {
+    kernel_functions<AttentionKernel<Shape<_2, _1, _1>>>(),
+    kernel_functions<AttentionKernel<Shape<_1, _2, _1>>>(),
+    kernel_functions<AttentionKernel<Shape<_2, _1, _1>, true>>(),
+    kernel_functions<AttentionKernel<Shape<_1, _2, _1>, true>>(),
+    kernel_functions<AttentionKernel<Shape<_2, _1, _1>, true, true,
+                                     cutlass::gemm::device::PresumOpt<>>>(),
+    kernel_functions<AttentionKernel<Shape<_1, _2, _1>, true, true,
+                                     cutlass::gemm::device::PresumOpt<>>>(),
+    kernel_functions<AttentionKernel<Shape<_1, _2, _1>, false, true,
+                                     cutlass::gemm::device::PresumOpt<>>>(),
+    kernel_functions<Mlp2Pingpong1x2>(),
+    kernel_functions<AttentionKernel<Shape<_1, _2, _1>, false, false>>()};
+constexpr int AttentionKernelCount =
+    sizeof(AttentionKernels) / sizeof(AttentionKernels[0]);
 
 __global__ void pack_activation(Element const* x, Element* packed, int m,
                                 int k) {
@@ -366,4 +412,46 @@ extern "C" int vllm_strassen_mlp2_run_v2(void const* x, void* packed_a,
                                     static_cast<Element*>(presums_b),
                                     static_cast<Element*>(output), workspace, m,
                                     n, k, device, sms, swizzle, raster, stream);
+}
+
+extern "C" int vllm_strassen_attention_configure() {
+  for (auto const& kernel : AttentionKernels) {
+    int status = kernel.configure();
+    if (status != 0) return status;
+  }
+  return 0;
+}
+
+extern "C" size_t vllm_strassen_attention_workspace_size(int m, int n, int k) {
+  size_t size = 0;
+  for (auto const& kernel : AttentionKernels) {
+    size = std::max(size, kernel.workspace_size(m, n, k));
+  }
+  return size;
+}
+
+extern "C" int vllm_strassen_attention_run_v1(
+    void const* x, void* packed_a, void const* packed_b, void* presums_b,
+    void* output, void* workspace, int m, int n, int k, int device, int sms,
+    int swizzle, int raster, int skip_activation_packing, int kernel_id,
+    void* stream_ptr) {
+  if (m <= 0 || m > 16384 || m % 1024 != 0 || (n != 8192 && n != 10240) ||
+      k != 8192 || kernel_id < 0 || kernel_id >= AttentionKernelCount ||
+      (swizzle != 1 && swizzle != 2 && swizzle != 4) ||
+      (raster != 0 && raster != 1) ||
+      ((kernel_id == 0 || kernel_id == 2 || kernel_id == 4) &&
+       (m / 512) % swizzle != 0)) {
+    return status_code(cutlass::Status::kErrorInvalidProblem);
+  }
+  auto stream = static_cast<cudaStream_t>(stream_ptr);
+  auto a = skip_activation_packing ? static_cast<Element const*>(x)
+                                   : static_cast<Element const*>(packed_a);
+  if (!skip_activation_packing) {
+    pack_activation<<<4096, 256, 0, stream>>>(
+        static_cast<Element const*>(x), static_cast<Element*>(packed_a), m, k);
+  }
+  return AttentionKernels[kernel_id].run(
+      a, static_cast<Element const*>(packed_b),
+      static_cast<Element*>(presums_b), static_cast<Element*>(output),
+      workspace, m, n, k, device, sms, swizzle, raster, stream);
 }

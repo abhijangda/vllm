@@ -206,6 +206,36 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if (
+            envs.VLLM_STRASSEN_QKV_CONFIG_PATH
+            or envs.VLLM_STRASSEN_ATTN_OUT_CONFIG_PATH
+        ):
+            if (
+                not envs.VLLM_STRASSEN_LIBRARY_PATH
+                or quant_config is not None
+                or tp_size != 1
+                or hidden_size != 8192
+                or self.q_size != 8192
+                or self.kv_size != 1024
+                or self.qk_norm
+                or envs.VLLM_BATCH_INVARIANT
+            ):
+                raise ValueError(
+                    "Strassen attention requires its library and unquantized "
+                    "TP=1 Qwen2.5-72B without QK normalization or batch invariance"
+                )
+            from vllm.model_executor.layers.strassen import (
+                StrassenAttentionLinearMethod,
+            )
+
+            if envs.VLLM_STRASSEN_QKV_CONFIG_PATH:
+                self.qkv_proj.quant_method = StrassenAttentionLinearMethod(
+                    "attention_qkv"
+                )
+            if envs.VLLM_STRASSEN_ATTN_OUT_CONFIG_PATH:
+                self.o_proj.quant_method = StrassenAttentionLinearMethod(
+                    "attention_o_proj"
+                )
 
         # QK Normalization support (used in BAGEL and some other models)
         if self.qk_norm:

@@ -24,9 +24,25 @@ MLP2_KERNELS = (
     "cooperative_reduce_4x256_opt_no_2x1",
     "cooperative_reduce_4x256_opt_no_1x2",
 )
+ATTENTION_KERNELS = (
+    "pingpong_reduce_2x128_opt_0000_2x1",
+    "pingpong_reduce_2x128_opt_0000_1x2",
+    "cooperative_pingpong_reduce_2x256_opt_0000_2x1",
+    "cooperative_pingpong_reduce_2x256_opt_0000_1x2",
+    "cooperative_pingpong_reduce_2x256_opt_no_2x1",
+    "cooperative_pingpong_reduce_2x256_opt_no_1x2",
+    "pingpong_reduce_2x128_opt_no_1x2",
+    "pingpong_reduce_4x128_opt_no_1x2",
+    "pingpong_2x128_opt_0000_1x2",
+)
+ATTENTION_OUTPUT_SIZES = {"attention_qkv": 10240, "attention_o_proj": 8192}
 UNSAFE_PACKING_WARNING = (
     "UNSAFE Strassen timing experiment: activation packing is DISABLED. "
     "Row-major activations are interpreted as quadrant-packed data; "
+    "model outputs are INCORRECT. Do not use this mode for inference."
+)
+UNSAFE_QKV_BIAS_WARNING = (
+    "UNSAFE Strassen timing experiment: QKV bias addition is DISABLED; "
     "model outputs are INCORRECT. Do not use this mode for inference."
 )
 
@@ -62,34 +78,56 @@ def load_strassen_configs(path: str) -> dict[int, tuple[int, int]]:
 
 
 @cache
-def load_mlp2_configs(path: str) -> dict[int, tuple[int, int, int]]:
+def _load_projection_configs(
+    path: str, kernels: tuple[str, ...], projection: str
+) -> dict[int, tuple[int, int, int]]:
     data = json.loads(Path(path).read_text())
     if not isinstance(data, dict) or set(data) != {
         str(tokens) for tokens in PREFILL_TOKEN_SIZES
     }:
-        raise ValueError("MLP2 config must cover every 1024-token multiple to 16384")
+        raise ValueError(
+            f"{projection} config must cover every 1024-token multiple to 16384"
+        )
     result = {}
     for tokens, config in data.items():
         if (
             not isinstance(config, dict)
-            or config.get("kernel") not in MLP2_KERNELS
+            or config.get("kernel") not in kernels
             or config.get("raster") not in ("N", "M")
             or type(config.get("swizzle")) is not int
             or config["swizzle"] not in (1, 2, 4)
         ):
-            raise ValueError(f"Invalid MLP2 Strassen configuration for {tokens} tokens")
+            raise ValueError(
+                f"Invalid {projection} Strassen configuration for {tokens} tokens"
+            )
         if (
             config["kernel"].endswith("2x1")
             and effective_strassen_swizzle(int(tokens), config["swizzle"])
             != config["swizzle"]
         ):
-            raise ValueError(f"Unsupported MLP2 swizzle for {tokens} tokens")
+            raise ValueError(f"Unsupported {projection} swizzle for {tokens} tokens")
         result[int(tokens)] = (
-            MLP2_KERNELS.index(config["kernel"]),
+            kernels.index(config["kernel"]),
             config["swizzle"],
             int(config["raster"] == "M"),
         )
     return result
+
+
+def load_mlp2_configs(path: str) -> dict[int, tuple[int, int, int]]:
+    return _load_projection_configs(path, MLP2_KERNELS, "MLP2")
+
+
+def load_attention_configs(path: str) -> dict[int, tuple[int, int, int]]:
+    return _load_projection_configs(path, ATTENTION_KERNELS, "attention")
+
+
+def attention_config_path(projection: str) -> str | None:
+    if projection == "attention_qkv":
+        return envs.VLLM_STRASSEN_QKV_CONFIG_PATH
+    if projection == "attention_o_proj":
+        return envs.VLLM_STRASSEN_ATTN_OUT_CONFIG_PATH
+    raise ValueError(f"Unknown Strassen attention projection: {projection}")
 
 
 def pad_mlp_token_rows(x: torch.Tensor, is_padding: torch.Tensor) -> torch.Tensor:
@@ -132,6 +170,19 @@ def _library() -> ctypes.CDLL:
         [ctypes.c_void_p] * 6 + [ctypes.c_int] * 9 + [ctypes.c_void_p]
     )
     lib.vllm_strassen_mlp2_run_v2.restype = ctypes.c_int
+    if (
+        envs.VLLM_STRASSEN_QKV_CONFIG_PATH
+        or envs.VLLM_STRASSEN_ATTN_OUT_CONFIG_PATH
+        or hasattr(lib, "vllm_strassen_attention_run_v1")
+    ):
+        lib.vllm_strassen_attention_configure.argtypes = []
+        lib.vllm_strassen_attention_configure.restype = ctypes.c_int
+        lib.vllm_strassen_attention_workspace_size.argtypes = [ctypes.c_int] * 3
+        lib.vllm_strassen_attention_workspace_size.restype = ctypes.c_size_t
+        lib.vllm_strassen_attention_run_v1.argtypes = (
+            [ctypes.c_void_p] * 6 + [ctypes.c_int] * 9 + [ctypes.c_void_p]
+        )
+        lib.vllm_strassen_attention_run_v1.restype = ctypes.c_int
     return lib
 
 
@@ -160,6 +211,21 @@ def _mlp2_workspace(device: torch.device) -> torch.Tensor:
         size = max(
             lib.vllm_strassen_mlp2_workspace_size(tokens, 8192, 29696)
             for tokens in PREFILL_TOKEN_SIZES
+        )
+        return torch.empty(size, dtype=torch.uint8, device=device)
+
+
+@cache
+def _attention_workspace(device: torch.device) -> torch.Tensor:
+    with torch.accelerator.device_index(device.index):
+        lib = _library()
+        _check_status(
+            lib.vllm_strassen_attention_configure(), "attention configuration"
+        )
+        size = max(
+            lib.vllm_strassen_attention_workspace_size(tokens, n, 8192)
+            for tokens in PREFILL_TOKEN_SIZES
+            for n in ATTENTION_OUTPUT_SIZES.values()
         )
         return torch.empty(size, dtype=torch.uint8, device=device)
 
@@ -347,64 +413,109 @@ direct_register_custom_op(
 )
 
 
-def strassen_bf16_mlp2(
+def _strassen_bf16_projection(
     x: torch.Tensor,
-    weight: torch.Tensor,
+    weight: torch.Tensor | None,
     packed: torch.Tensor,
     presums: torch.Tensor,
     workspace: torch.Tensor,
     kernel_id: int,
     swizzle: int,
     raster: int,
+    projection: str,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if projection == "attention_qkv":
+        if envs.VLLM_STRASSEN_UNSAFE_SKIP_QKV_BIAS:
+            logger.warning_once(UNSAFE_QKV_BIAS_WARNING)
+            bias = None
+        logger.info_once("Strassen QKV bias addition=%s", bias is not None)
+    result_rows = None
+    if (
+        envs.VLLM_STRASSEN_PAD_TOKEN_ROWS
+        and x.ndim == 2
+        and 0 < x.shape[0] <= PREFILL_TOKEN_SIZES[-1]
+        and x.shape[0] not in PREFILL_TOKEN_SIZES
+    ):
+        result_rows = x.shape[0]
+        x = F.pad(x, (0, 0, 0, -result_rows % 1024))
     if x.ndim != 2 or x.shape[0] not in PREFILL_TOKEN_SIZES:
-        return F.linear(x, weight)
+        if weight is None:
+            raise RuntimeError(
+                f"Strassen {projection} dense weights were released; use "
+                "zero-padded supported token counts."
+            )
+        return F.linear(x, weight, bias)
     m, k = x.shape
-    if envs.VLLM_STRASSEN_MLP2_CONFIG_PATH:
-        kernel_id, swizzle, raster = load_mlp2_configs(
-            envs.VLLM_STRASSEN_MLP2_CONFIG_PATH
+    lib = _library()
+    if projection == "MLP2":
+        n, expected_k = 8192, 29696
+        kernels: tuple[str, ...] = MLP2_KERNELS
+        config_path = envs.VLLM_STRASSEN_MLP2_CONFIG_PATH
+        workspace_size = lib.vllm_strassen_mlp2_workspace_size
+        run = lib.vllm_strassen_mlp2_run_v2
+    else:
+        config_path = attention_config_path(projection)
+        n, expected_k = ATTENTION_OUTPUT_SIZES[projection], 8192
+        kernels = ATTENTION_KERNELS
+        workspace_size = lib.vllm_strassen_attention_workspace_size
+        run = lib.vllm_strassen_attention_run_v1
+    if config_path:
+        kernel_id, swizzle, raster = _load_projection_configs(
+            config_path, kernels, projection
         )[m]
     if (
         x.dtype != torch.bfloat16
         or not x.is_cuda
         or not x.is_contiguous()
-        or k != 29696
-        or weight.shape != (8192, k)
-        or packed.shape != (k, 8192)
+        or k != expected_k
+        or (weight is not None and weight.shape != (n, k))
+        or packed.shape != (k, n)
         or presums.shape != packed.shape
         or any(
             t.dtype != torch.bfloat16 or t.device != x.device or not t.is_contiguous()
             for t in (weight, packed, presums)
+            if t is not None
         )
         or workspace.device != x.device
         or workspace.dtype != torch.uint8
         or not workspace.is_contiguous()
-        or not 0 <= kernel_id < len(MLP2_KERNELS)
+        or not 0 <= kernel_id < len(kernels)
         or swizzle not in (1, 2, 4)
         or raster not in (0, 1)
+        or (
+            bias is not None
+            and (
+                bias.shape != (n,)
+                or bias.dtype != x.dtype
+                or bias.device != x.device
+                or not bias.is_contiguous()
+            )
+        )
     ):
         raise ValueError(
-            "MLP2 Strassen requires compatible BF16 weights and configuration"
+            f"{projection} Strassen requires compatible BF16 weights and configuration"
         )
     if (
-        MLP2_KERNELS[kernel_id].endswith("2x1")
+        kernels[kernel_id].endswith("2x1")
         and effective_strassen_swizzle(m, swizzle) != swizzle
     ):
-        raise ValueError(f"Unsupported MLP2 swizzle {swizzle} for {m} tokens")
-    lib = _library()
-    if workspace.numel() < lib.vllm_strassen_mlp2_workspace_size(m, 8192, k):
-        raise ValueError("MLP2 Strassen workspace is too small")
+        raise ValueError(f"Unsupported {projection} swizzle {swizzle} for {m} tokens")
+    if workspace.numel() < workspace_size(m, n, k):
+        raise ValueError(f"{projection} Strassen workspace is too small")
     skip_packing = envs.VLLM_STRASSEN_UNSAFE_SKIP_ACTIVATION_PACKING
     if skip_packing:
         logger.warning_once(UNSAFE_PACKING_WARNING)
     packed_a = None if skip_packing else torch.empty_like(x)
-    output = x.new_empty((m, 8192))
+    output = x.new_empty((m, n))
     logger.info_once(
-        "Strassen MLP2 CUDA launch: M=%d N=8192 K=%d; kernel=%s; "
+        "Strassen %s CUDA launch: M=%d N=%d K=%d; kernel=%s; "
         "raster=%d swizzle=%d; activation packing=%s",
+        projection,
         m,
+        n,
         k,
-        MLP2_KERNELS[kernel_id],
+        kernels[kernel_id],
         raster,
         swizzle,
         not skip_packing,
@@ -413,7 +524,7 @@ def strassen_bf16_mlp2(
         device = x.device.index
         assert device is not None
         _check_status(
-            lib.vllm_strassen_mlp2_run_v2(
+            run(
                 x.data_ptr(),
                 packed_a.data_ptr() if packed_a is not None else None,
                 packed.data_ptr(),
@@ -421,7 +532,7 @@ def strassen_bf16_mlp2(
                 output.data_ptr(),
                 workspace.data_ptr(),
                 m,
-                8192,
+                n,
                 k,
                 device,
                 torch.cuda.get_device_properties(device).multi_processor_count,
@@ -431,14 +542,16 @@ def strassen_bf16_mlp2(
                 kernel_id,
                 torch.cuda.current_stream(device).cuda_stream,
             ),
-            "MLP2 projection",
+            f"{projection} projection",
         )
-    return output
+        if bias is not None:
+            output.add_(bias)
+    return output[:result_rows] if result_rows is not None else output
 
 
-def _strassen_bf16_mlp2_fake(
+def strassen_bf16_mlp2(
     x: torch.Tensor,
-    weight: torch.Tensor,
+    weight: torch.Tensor | None,
     packed: torch.Tensor,
     presums: torch.Tensor,
     workspace: torch.Tensor,
@@ -446,7 +559,23 @@ def _strassen_bf16_mlp2_fake(
     swizzle: int,
     raster: int,
 ) -> torch.Tensor:
-    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+    return _strassen_bf16_projection(
+        x, weight, packed, presums, workspace, kernel_id, swizzle, raster, "MLP2"
+    )
+
+
+def _strassen_bf16_mlp2_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    packed: torch.Tensor,
+    presums: torch.Tensor,
+    workspace: torch.Tensor,
+    kernel_id: int,
+    swizzle: int,
+    raster: int,
+) -> torch.Tensor:
+    n = weight.shape[0] if weight is not None else packed.shape[1]
+    return x.new_empty((*x.shape[:-1], n))
 
 
 direct_register_custom_op(
@@ -455,6 +584,131 @@ direct_register_custom_op(
     mutates_args=["workspace"],
     fake_impl=_strassen_bf16_mlp2_fake,
 )
+
+
+def strassen_bf16_attention(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    packed: torch.Tensor,
+    presums: torch.Tensor,
+    workspace: torch.Tensor,
+    projection: str,
+    kernel_id: int,
+    swizzle: int,
+    raster: int,
+) -> torch.Tensor:
+    attention_config_path(projection)
+    return _strassen_bf16_projection(
+        x,
+        weight,
+        packed,
+        presums,
+        workspace,
+        kernel_id,
+        swizzle,
+        raster,
+        projection,
+        bias,
+    )
+
+
+def _strassen_bf16_attention_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    packed: torch.Tensor,
+    presums: torch.Tensor,
+    workspace: torch.Tensor,
+    projection: str,
+    kernel_id: int,
+    swizzle: int,
+    raster: int,
+) -> torch.Tensor:
+    n = weight.shape[0] if weight is not None else packed.shape[1]
+    return x.new_empty((*x.shape[:-1], n))
+
+
+direct_register_custom_op(
+    "strassen_bf16_attention",
+    strassen_bf16_attention,
+    mutates_args=["workspace"],
+    fake_impl=_strassen_bf16_attention_fake,
+)
+
+
+def _release_dense_weight(layer: torch.nn.Module, projection: str) -> None:
+    if not envs.VLLM_STRASSEN_DROP_DENSE_WEIGHTS:
+        return
+    if not envs.VLLM_STRASSEN_PAD_TOKEN_ROWS:
+        raise ValueError(
+            "Dropping Strassen dense weights requires VLLM_STRASSEN_PAD_TOKEN_ROWS=1"
+        )
+    layer.register_parameter("weight", None)
+    logger.info(
+        "Released dense %s weight for %s; packed weights and pre-sums "
+        "are retained, and non-Strassen fallback is disabled.",
+        projection,
+        layer.prefix,
+    )
+
+
+class StrassenAttentionLinearMethod(UnquantizedLinearMethod):
+    """Opt-in BF16 QKV/output projections retaining the original channel layout."""
+
+    def __init__(self, projection: str) -> None:
+        super().__init__()
+        attention_config_path(projection)
+        self.projection = projection
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        path = attention_config_path(self.projection)
+        if not path:
+            raise ValueError(f"Missing Strassen {self.projection} configuration")
+        load_attention_configs(path)
+        n = ATTENTION_OUTPUT_SIZES[self.projection]
+        if layer.weight.shape != (n, 8192):
+            raise ValueError("Strassen attention requires TP=1 Qwen2.5-72B weights")
+        if (
+            self.projection == "attention_qkv"
+            and envs.VLLM_STRASSEN_UNSAFE_SKIP_QKV_BIAS
+        ):
+            logger.warning_once(UNSAFE_QKV_BIAS_WARNING)
+        packed, presums = prepare_strassen_weight(layer.weight)
+        layer.register_buffer("strassen_packed_weight", packed, persistent=False)
+        layer.register_buffer("strassen_weight_presums", presums, persistent=False)
+        layer.register_buffer(
+            "strassen_workspace",
+            _attention_workspace(layer.weight.device),
+            persistent=False,
+        )
+        logger.info(
+            "Prepared BF16 Strassen %s %s: weight=%s",
+            self.projection,
+            layer.prefix,
+            tuple(layer.weight.shape),
+        )
+        _release_dense_weight(layer, self.projection)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.strassen_bf16_attention(
+            x,
+            layer.weight,
+            bias,
+            layer.strassen_packed_weight,
+            layer.strassen_weight_presums,
+            layer.strassen_workspace,
+            self.projection,
+            0,
+            1,
+            0,
+        )
 
 
 class StrassenLinearMethod(UnquantizedLinearMethod):
@@ -515,13 +769,7 @@ class StrassenLinearMethod(UnquantizedLinearMethod):
             if envs.VLLM_STRASSEN_CLUSTER_PARITY
             else PREFILL_TOKEN_SIZES,
         )
-        if drop_dense:
-            layer.register_parameter("weight", None)
-            logger.info(
-                "Released dense MLP1 weight for %s; packed weights and pre-sums "
-                "are retained, and non-Strassen fallback is disabled.",
-                layer.prefix,
-            )
+        _release_dense_weight(layer, "MLP1")
 
     def apply(
         self,
@@ -566,6 +814,7 @@ class StrassenDownLinearMethod(UnquantizedLinearMethod):
                 persistent=False,
             )
             logger.info("Prepared BF16 Strassen MLP2 %s", layer.prefix)
+            _release_dense_weight(layer, "MLP2")
 
     def apply(
         self,
