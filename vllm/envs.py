@@ -53,6 +53,11 @@ if TYPE_CHECKING:
     VLLM_STRASSEN_SWIZZLE: int = 1
     VLLM_STRASSEN_RASTER: str = "N"
     VLLM_STRASSEN_UNSAFE_SKIP_ACTIVATION_PACKING: bool = False
+    VLLM_STRASSEN_CONFIG_PATH: str | None = None
+    VLLM_STRASSEN_PAD_TOKEN_ROWS: bool = False
+    VLLM_STRASSEN_DROP_DENSE_WEIGHTS: bool = False
+    VLLM_STRASSEN_CLUSTER_PARITY: bool = False
+    VLLM_STRASSEN_MLP2_CONFIG_PATH: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -886,6 +891,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_STRASSEN_RASTER": lambda: os.getenv("VLLM_STRASSEN_RASTER", "N"),
     "VLLM_STRASSEN_UNSAFE_SKIP_ACTIVATION_PACKING": lambda: bool(
         int(os.getenv("VLLM_STRASSEN_UNSAFE_SKIP_ACTIVATION_PACKING", "0"))
+    ),
+    "VLLM_STRASSEN_CONFIG_PATH": lambda: os.getenv("VLLM_STRASSEN_CONFIG_PATH"),
+    "VLLM_STRASSEN_PAD_TOKEN_ROWS": lambda: bool(
+        int(os.getenv("VLLM_STRASSEN_PAD_TOKEN_ROWS", "0"))
+    ),
+    "VLLM_STRASSEN_DROP_DENSE_WEIGHTS": lambda: bool(
+        int(os.getenv("VLLM_STRASSEN_DROP_DENSE_WEIGHTS", "0"))
+    ),
+    "VLLM_STRASSEN_CLUSTER_PARITY": lambda: bool(
+        int(os.getenv("VLLM_STRASSEN_CLUSTER_PARITY", "0"))
+    ),
+    "VLLM_STRASSEN_MLP2_CONFIG_PATH": lambda: os.getenv(
+        "VLLM_STRASSEN_MLP2_CONFIG_PATH"
     ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB

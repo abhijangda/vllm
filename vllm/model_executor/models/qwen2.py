@@ -89,6 +89,12 @@ class Qwen2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.pad_token_rows = envs.VLLM_STRASSEN_PAD_TOKEN_ROWS
+        if self.pad_token_rows and not envs.VLLM_MOE_SKIP_PADDING:
+            raise ValueError(
+                "VLLM_STRASSEN_PAD_TOKEN_ROWS requires VLLM_MOE_SKIP_PADDING=1 "
+                "to populate the live CUDA-graph padding mask"
+            )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -128,10 +134,21 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        num_rows = x.shape[0]
+        if self.pad_token_rows:
+            from vllm.forward_context import get_forward_context
+            from vllm.model_executor.layers.strassen import pad_mlp_token_rows
+
+            is_padding = get_forward_context().is_padding
+            if is_padding is None:
+                raise RuntimeError(
+                    "MLP token padding requires the forward padding mask"
+                )
+            x = pad_mlp_token_rows(x, is_padding)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
-        return x
+        return x[:num_rows] if self.pad_token_rows else x
 
 
 class Qwen2Attention(nn.Module):
